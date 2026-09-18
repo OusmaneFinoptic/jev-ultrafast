@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -11,7 +12,11 @@ from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
-MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+
+
+def render_script(source, cache_key):
+    """Bind browser-side state to an unpredictable per-session property."""
+    return source.replace("__JEV_CACHE_KEY__", json.dumps(cache_key))
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
@@ -20,6 +25,7 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
+        self.cache_key = "jev-" + secrets.token_urlsafe(18)
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
@@ -48,8 +54,8 @@ class Browser:
             try:
                 self.call(
                     "Runtime.evaluate",
-                    expression="""(action => new Promise(resolve => {
-                      const field=window.__jevFast?.nodes.get(action.node);
+                    expression=render_script("""(action => new Promise(resolve => {
+                      const field=window[__JEV_CACHE_KEY__]?.nodes.get(action.node);
                       const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
@@ -68,7 +74,7 @@ class Browser:
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
-                    }))(""" + json.dumps(action) + ")",
+                    }))(""", self.cache_key) + json.dumps(action) + ")",
                     awaitPromise=True,
                     returnByValue=True,
                 )
@@ -77,7 +83,12 @@ class Browser:
         for attempt in range(10):
             try:
                 return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                    {
+                        "operation": "observe",
+                        "session": self.session,
+                        "screenshot": screenshot,
+                        "cache_key": self.cache_key,
+                    }
                 )
             except StalePage:
                 if attempt == 9:
@@ -91,18 +102,32 @@ class Browser:
             if type(node) is not int:
                 return False
             current = self.evaluate(
-                "(() => { const c=window.__jevFast; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                render_script(
+                    "(() => { const c=window[__JEV_CACHE_KEY__]; "
+                    f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()",
+                    self.cache_key,
+                )
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
-        return self.evaluate(MARKER) == page["marker"]
+        marker = render_script(
+            f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()", self.cache_key
+        )
+        return self.evaluate(marker) == page["marker"]
 
     def act(self, action, page, text=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        result = browser_operation(
+            {
+                "operation": "act",
+                "session": self.session,
+                "action": action,
+                "text": text,
+                "cache_key": self.cache_key,
+            }
+        )
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -120,6 +145,7 @@ def fingerprint(state):
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
+    cache_key = request.get("cache_key", "jev-session")
 
     def call(method, **params):
         return cdp(method, session_id=session, **params)
@@ -141,8 +167,8 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate("""(action => {
-              const e=window.__jevFast?.nodes.get(action.node);
+            target = evaluate(render_script("""(action => {
+              const e=window[__JEV_CACHE_KEY__]?.nodes.get(action.node);
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
@@ -157,7 +183,7 @@ def browser_operation(request):
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
               return {x,y};
-            })(""" + json.dumps(action) + ")")
+            })(""", cache_key) + json.dumps(action) + ")")
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
@@ -185,7 +211,7 @@ def browser_operation(request):
                     call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
-    info = evaluate(READ_STATE)
+    info = evaluate(render_script(READ_STATE, cache_key))
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)

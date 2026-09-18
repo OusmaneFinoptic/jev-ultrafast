@@ -9,7 +9,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
-from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.browser import StalePage, browser_operation, fingerprint, render_script
 
 
 def page():
@@ -274,6 +274,12 @@ def test_fingerprint_tracks_values_and_identity_not_screenshots():
     assert fingerprint(p) == fingerprint(other)
     other["actions"][0]["node"] = 99
     assert fingerprint(p) != fingerprint(other)
+
+
+def test_browser_cache_name_is_session_scoped_not_a_fixed_fingerprint():
+    rendered = render_script("window[__JEV_CACHE_KEY__]", "jev-random-session")
+    assert rendered == 'window["jev-random-session"]'
+    assert "__jevFast" not in rendered
 
 
 @pytest.mark.parametrize("changed", ["Departure", "Where from?", "Where to?", "year"])
